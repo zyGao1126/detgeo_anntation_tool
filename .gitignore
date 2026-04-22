@@ -1,0 +1,7 @@
+**/__pycache__/
+.vscode/
+*.png
+*.jpg
+*.jsonl
+*.json
+*.db
