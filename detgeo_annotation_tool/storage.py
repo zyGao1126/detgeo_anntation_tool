@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS annotation_cases (
     case_id TEXT PRIMARY KEY,
     pair_id TEXT NOT NULL,
     case_name TEXT NOT NULL DEFAULT '',
-    case_type TEXT NOT NULL DEFAULT 'both_exist_single',
+    case_type TEXT NOT NULL DEFAULT 'single_target',
     category TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'raw',
     description TEXT NOT NULL DEFAULT '',
@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS annotation_cases (
     color_hex TEXT NOT NULL DEFAULT '#4E79A7',
     uav_annotations TEXT NOT NULL DEFAULT '[]',
     sat_annotations TEXT NOT NULL DEFAULT '[]',
+    hard_negative_image_path TEXT NOT NULL DEFAULT '',
+    hard_negative_bbox TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(pair_id) REFERENCES pairs(pair_id) ON DELETE CASCADE
@@ -130,6 +132,14 @@ class Database:
         if columns and "category" not in columns:
             conn.execute(
                 "ALTER TABLE annotation_cases ADD COLUMN category TEXT NOT NULL DEFAULT ''"
+            )
+        if columns and "hard_negative_image_path" not in columns:
+            conn.execute(
+                "ALTER TABLE annotation_cases ADD COLUMN hard_negative_image_path TEXT NOT NULL DEFAULT ''"
+            )
+        if columns and "hard_negative_bbox" not in columns:
+            conn.execute(
+                "ALTER TABLE annotation_cases ADD COLUMN hard_negative_bbox TEXT NOT NULL DEFAULT '[]'"
             )
 
     def connect(self) -> sqlite3.Connection:

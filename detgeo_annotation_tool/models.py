@@ -26,12 +26,24 @@ QUERY_TYPES = [
 QA_STATUSES = ["raw", "checked", "passed"]
 CASE_STATUSES = ["raw", "in_progress", "done"]
 CASE_TYPES = [
-    "both_exist_single",
-    "both_exist_multi",
-    "uav_only_single",
-    "uav_only_multi",
-    "neither_exist",
+    "single_target",
+    "multiple_target",
 ]
+
+LEGACY_CASE_TYPE_MAP = {
+    "both_exist_single": "single_target",
+    "uav_only_single": "single_target",
+    "neither_exist": "single_target",
+    "partial_match": "single_target",
+    "both_exist_multi": "multiple_target",
+    "uav_only_multi": "multiple_target",
+}
+
+
+def normalize_case_type(case_type: str) -> str:
+    if case_type in CASE_TYPES:
+        return case_type
+    return LEGACY_CASE_TYPE_MAP.get(case_type, CASE_TYPES[0])
 
 
 def default_attributes() -> dict[str, str]:
@@ -131,7 +143,7 @@ class AnnotationCase:
     case_id: str
     pair_id: str
     case_name: str
-    case_type: str = "both_exist_single"
+    case_type: str = "single_target"
     category: str = ""
     status: str = "raw"
     description: str = ""
@@ -139,6 +151,8 @@ class AnnotationCase:
     color_hex: str = "#4E79A7"
     uav_annotations: list[dict[str, Any]] = field(default_factory=list)
     sat_annotations: list[dict[str, Any]] = field(default_factory=list)
+    hard_negative_image_path: str = ""
+    hard_negative_bbox: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

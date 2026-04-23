@@ -35,6 +35,12 @@ class Exporter:
             if Path(pair.sat_image_path).exists():
                 shutil.copy2(pair.sat_image_path, sat_dst)
 
+            hard_negative_dst = ""
+            if case.hard_negative_image_path and Path(case.hard_negative_image_path).exists():
+                hard_negative_dst_path = case_dir / Path(case.hard_negative_image_path).name
+                shutil.copy2(case.hard_negative_image_path, hard_negative_dst_path)
+                hard_negative_dst = str(hard_negative_dst_path)
+
             sat_annotations = []
             for ann in case.sat_annotations:
                 ann_copy = dict(ann)
@@ -60,6 +66,8 @@ class Exporter:
                     "color_hex": case.color_hex,
                     "uav_image_path": str(uav_dst),
                     "sat_image_path": str(sat_dst),
+                    "hard_negative_image_path": hard_negative_dst,
+                    "hard_negative_bbox": case.hard_negative_bbox,
                     "uav_annotations": case.uav_annotations,
                     "sat_annotations": sat_annotations,
                 }

@@ -7,7 +7,16 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw
 
-from .models import AnnotationCase, Link, Pair, SetQuery, SatObject, UAVObject, default_attributes
+from .models import (
+    AnnotationCase,
+    Link,
+    Pair,
+    SetQuery,
+    SatObject,
+    UAVObject,
+    default_attributes,
+    normalize_case_type,
+)
 from .storage import Database
 
 
@@ -102,7 +111,7 @@ def _row_to_case(row: Any) -> AnnotationCase:
         case_id=row["case_id"],
         pair_id=row["pair_id"],
         case_name=row["case_name"],
-        case_type=row["case_type"],
+        case_type=normalize_case_type(row["case_type"]),
         category=row["category"] if "category" in row.keys() else "",
         status=row["status"],
         description=row["description"],
@@ -110,6 +119,8 @@ def _row_to_case(row: Any) -> AnnotationCase:
         color_hex=row["color_hex"],
         uav_annotations=_json_loads(row["uav_annotations"], []),
         sat_annotations=_json_loads(row["sat_annotations"], []),
+        hard_negative_image_path=row["hard_negative_image_path"] if "hard_negative_image_path" in row.keys() else "",
+        hard_negative_bbox=_json_loads(row["hard_negative_bbox"], []),
     )
 
 
@@ -216,13 +227,15 @@ class AnnotationRepository:
         return int(row["count"])
 
     def save_annotation_case(self, case: AnnotationCase) -> None:
+        case.case_type = normalize_case_type(case.case_type)
         with self.db.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO annotation_cases (
                     case_id, pair_id, case_name, case_type, category, status, description, notes,
-                    color_hex, uav_annotations, sat_annotations, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    color_hex, uav_annotations, sat_annotations, hard_negative_image_path,
+                    hard_negative_bbox, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(case_id) DO UPDATE SET
                     pair_id=excluded.pair_id,
                     case_name=excluded.case_name,
@@ -234,6 +247,8 @@ class AnnotationRepository:
                     color_hex=excluded.color_hex,
                     uav_annotations=excluded.uav_annotations,
                     sat_annotations=excluded.sat_annotations,
+                    hard_negative_image_path=excluded.hard_negative_image_path,
+                    hard_negative_bbox=excluded.hard_negative_bbox,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -248,6 +263,8 @@ class AnnotationRepository:
                     case.color_hex,
                     _json_dumps(case.uav_annotations),
                     _json_dumps(case.sat_annotations),
+                    case.hard_negative_image_path,
+                    _json_dumps(case.hard_negative_bbox),
                 ),
             )
         self.refresh_pair_status(case.pair_id)
@@ -294,7 +311,7 @@ class AnnotationRepository:
             case_id=self.generate_id("case"),
             pair_id=pair_id,
             case_name=case_name,
-            case_type=case_type,
+            case_type=normalize_case_type(case_type),
             category="",
             color_hex=color_hex,
         )

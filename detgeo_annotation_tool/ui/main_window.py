@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..models import AnnotationCase, CASE_STATUSES, CASE_TYPES, PAIR_STATUSES
+from ..models import AnnotationCase, CASE_STATUSES, CASE_TYPES, PAIR_STATUSES, normalize_case_type
 from ..repository import AnnotationRepository
 from ..services.exporter import Exporter
 from ..services.sam3_process import SAM3ProcessClient
@@ -105,10 +106,11 @@ class MainWindow(QMainWindow):
         self.saved_anno_root.mkdir(parents=True, exist_ok=True)
         self.ui_state_path = self.workspace_dir / "ui_state.json"
         self.ui_state = self._load_ui_state()
+        sam3_repo_root, sam3_checkpoint_path = self._resolve_sam3_paths()
         self.sam3_client = SAM3ProcessClient(
             project_root=self.project_root,
-            repo_root=Path("/home/gaoziyang/research/RRSIS/sam3"),
-            checkpoint_path=Path("/home/gaoziyang/research/RRSIS/sam3/checkpoints/sam3.pt"),
+            repo_root=sam3_repo_root,
+            checkpoint_path=sam3_checkpoint_path,
             parent=self,
         )
         self.sam3_preload_scheduled = False
@@ -123,6 +125,9 @@ class MainWindow(QMainWindow):
         self.current_case_id = ""
         self.active_viewer_name = "uav"
         self.sat_annotation_mode = "sam3"
+        self.satellite_view_mode = "original"
+        self.pending_hard_negative_by_case: dict[str, dict] = {}
+        self.hard_negative_capture_active = False
 
         self.setWindowTitle("DetGeo 二次加工标注工具")
         self._build_ui()
@@ -130,6 +135,8 @@ class MainWindow(QMainWindow):
         self.refresh_pair_filters()
         self.refresh_pair_list()
         self._install_shortcuts()
+        self.log(f"SAM3 repo root: {sam3_repo_root}")
+        self.log(f"SAM3 checkpoint: {sam3_checkpoint_path}")
 
     def _load_ui_state(self) -> dict:
         if not self.ui_state_path.exists():
@@ -161,6 +168,51 @@ class MainWindow(QMainWindow):
         if pair and pair.uav_image_path:
             return Path(pair.uav_image_path).stem
         return self.current_pair_id or "uav_view"
+
+    def _resolve_sam3_paths(self) -> tuple[Path, Path]:
+        default_repo_root = Path("/home/gaoziyang/research/RRSIS/sam3")
+        repo_root = Path(os.environ.get("DETGEO_SAM3_REPO", str(default_repo_root))).expanduser()
+        default_checkpoint = repo_root / "checkpoints" / "sam3.pt"
+        checkpoint_path = Path(
+            os.environ.get("DETGEO_SAM3_CHECKPOINT", str(default_checkpoint))
+        ).expanduser()
+        return repo_root, checkpoint_path
+
+    def _get_pending_hard_negative(self, case_id: str) -> dict | None:
+        if not case_id:
+            return None
+        return self.pending_hard_negative_by_case.get(case_id)
+
+    def _get_case_hard_negative_path(self, case: AnnotationCase | None) -> str:
+        if not case:
+            return ""
+        pending = self._get_pending_hard_negative(case.case_id)
+        if pending:
+            return pending.get("image_path", "")
+        return case.hard_negative_image_path
+
+    def _case_has_hard_negative(self, case: AnnotationCase | None) -> bool:
+        path = self._get_case_hard_negative_path(case)
+        return bool(path and Path(path).exists())
+
+    def _focus_bbox_for_hard_negative(self, case: AnnotationCase | None, pair=None) -> list[float]:
+        if case:
+            boxes: list[list[float]] = []
+            for ann in case.sat_annotations:
+                bbox = ann.get("bbox", [])
+                if len(bbox) == 4:
+                    boxes.append([float(v) for v in bbox])
+            if boxes:
+                return [
+                    min(box[0] for box in boxes),
+                    min(box[1] for box in boxes),
+                    max(box[2] for box in boxes),
+                    max(box[3] for box in boxes),
+                ]
+        pair = pair or (self.repo.get_pair(self.current_pair_id) if self.current_pair_id else None)
+        if pair and len(pair.original_gt_bbox) == 4:
+            return [float(v) for v in pair.original_gt_bbox]
+        return []
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -320,6 +372,16 @@ class MainWindow(QMainWindow):
 
         sat_box = QGroupBox("Satellite Viewer")
         sat_layout = QVBoxLayout(sat_box)
+        sat_toolbar = QHBoxLayout()
+        self.generate_hard_negative_button = QPushButton("Generate Hard Negative")
+        self.toggle_satellite_view_button = QToolButton()
+        self.toggle_satellite_view_button.setText("<->")
+        self.sat_view_mode_label = QLabel("View: original")
+        sat_toolbar.addWidget(self.generate_hard_negative_button)
+        sat_toolbar.addStretch(1)
+        sat_toolbar.addWidget(self.sat_view_mode_label)
+        sat_toolbar.addWidget(self.toggle_satellite_view_button)
+        sat_layout.addLayout(sat_toolbar)
         self.sat_view = AnnotatedImageView("sat")
         sat_layout.addWidget(self.sat_view)
         split.addWidget(sat_box)
@@ -348,6 +410,7 @@ class MainWindow(QMainWindow):
         self.case_status_combo = QComboBox()
         self.case_status_combo.addItems(CASE_STATUSES)
         self.case_color_label = QLabel("-")
+        self.hard_negative_label = QLabel("-")
         self.case_description_edit = QPlainTextEdit()
         self.case_description_edit.setFixedHeight(120)
         self.case_notes_edit = QPlainTextEdit()
@@ -357,6 +420,7 @@ class MainWindow(QMainWindow):
         form.addRow("Category", self.case_category_combo)
         form.addRow("Case Status", self.case_status_combo)
         form.addRow("Case Color", self.case_color_label)
+        form.addRow("Hard Negative", self.hard_negative_label)
         form.addRow("Description", self.case_description_edit)
         form.addRow("Notes", self.case_notes_edit)
         layout.addLayout(form)
@@ -415,6 +479,8 @@ class MainWindow(QMainWindow):
         self.delete_case_button.clicked.connect(self.delete_current_case)
         self.save_anno_button.clicked.connect(self.save_case_annotation_bundle)
         self.save_case_button.clicked.connect(self.save_case_metadata)
+        self.generate_hard_negative_button.clicked.connect(self.start_hard_negative_capture)
+        self.toggle_satellite_view_button.clicked.connect(self.toggle_satellite_view)
         self.cases_table.itemSelectionChanged.connect(self._on_case_table_selected)
         self.export_button.clicked.connect(self.export_workspace)
         self.sam3_client.stateChanged.connect(self._on_sam3_state_changed)
@@ -465,12 +531,13 @@ class MainWindow(QMainWindow):
 
     def load_pair(self, pair_id: str, keep_case_id: str = "") -> None:
         self.current_pair_id = pair_id
+        self.hard_negative_capture_active = False
+        self.satellite_view_mode = "original"
         pair = self.repo.get_pair(pair_id)
         if not pair:
             return
 
         self.uav_view.set_image(pair.uav_image_path)
-        self.sat_view.set_image(pair.sat_image_path)
         if keep_case_id:
             self.current_case_id = keep_case_id
         cases = self.repo.list_annotation_cases(pair_id)
@@ -528,19 +595,26 @@ class MainWindow(QMainWindow):
             self.save_case_button,
             self.delete_case_button,
             self.save_anno_button,
+            self.generate_hard_negative_button,
+            self.toggle_satellite_view_button,
         ]
         enabled = case is not None
         for widget in widgets:
             widget.setEnabled(enabled)
         if not case:
             self.case_name_edit.clear()
+            self.case_type_combo.setCurrentIndex(0)
             self.case_category_combo.setCurrentIndex(0)
+            self.case_status_combo.setCurrentIndex(0)
             self.case_description_edit.clear()
             self.case_notes_edit.clear()
             self.case_color_label.setText("-")
+            self.hard_negative_label.setText("-")
+            self.hard_negative_label.setToolTip("")
+            self.sat_view_mode_label.setText("View: original")
             return
         self.case_name_edit.setText(case.case_name)
-        self.case_type_combo.setCurrentText(case.case_type)
+        self.case_type_combo.setCurrentText(normalize_case_type(case.case_type))
         pair = self.repo.get_pair(case.pair_id)
         category = case.category or self._default_category_for_class(pair.original_class if pair else "")
         self.case_category_combo.setCurrentText(category)
@@ -548,6 +622,13 @@ class MainWindow(QMainWindow):
         self.case_description_edit.setPlainText(case.description)
         self.case_notes_edit.setPlainText(case.notes)
         self.case_color_label.setText(case.color_hex)
+        hard_negative_path = self._get_case_hard_negative_path(case)
+        if hard_negative_path and Path(hard_negative_path).exists():
+            self.hard_negative_label.setText(Path(hard_negative_path).name)
+            self.hard_negative_label.setToolTip(hard_negative_path)
+        else:
+            self.hard_negative_label.setText("not generated")
+            self.hard_negative_label.setToolTip("")
 
     def refresh_viewers(self) -> None:
         if not self.current_pair_id:
@@ -555,15 +636,41 @@ class MainWindow(QMainWindow):
         pair = self.repo.get_pair(self.current_pair_id)
         cases = self.repo.list_annotation_cases(self.current_pair_id)
         self.uav_view.set_saved_cases(cases, side="uav", selected_case_id=self.current_case_id)
-        self.sat_view.set_saved_cases(cases, side="sat", selected_case_id=self.current_case_id)
         self.uav_view.set_reference_data(pair, self.reference_toggle.isChecked())
-        self.sat_view.set_reference_data(pair, self.reference_toggle.isChecked())
+        self.refresh_satellite_view(pair=pair, cases=cases)
+
+    def refresh_satellite_view(self, pair=None, cases: list[AnnotationCase] | None = None) -> None:
+        if not self.current_pair_id:
+            return
+        pair = pair or self.repo.get_pair(self.current_pair_id)
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        cases = cases if cases is not None else self.repo.list_annotation_cases(self.current_pair_id)
+        if not pair:
+            return
+
+        if self.satellite_view_mode == "hard_negative" and not self._case_has_hard_negative(case):
+            self.satellite_view_mode = "original"
+
+        if self.satellite_view_mode == "hard_negative":
+            sat_path = self._get_case_hard_negative_path(case)
+            self.sat_view.set_image(sat_path)
+            self.sat_view.set_saved_cases([], side="sat", selected_case_id=self.current_case_id)
+            self.sat_view.set_reference_data(None, False)
+            self.sat_view_mode_label.setText("View: hard negative")
+        else:
+            self.sat_view.set_image(pair.sat_image_path)
+            self.sat_view.set_saved_cases(cases, side="sat", selected_case_id=self.current_case_id)
+            self.sat_view.set_reference_data(pair, self.reference_toggle.isChecked())
+            self.sat_view_mode_label.setText("View: original")
+
+        self.toggle_satellite_view_button.setEnabled(case is not None and self._case_has_hard_negative(case))
 
     def _on_case_table_selected(self) -> None:
         rows = self.cases_table.selectionModel().selectedRows()
         if not rows:
             return
         self.current_case_id = self.cases_table.item(rows[0].row(), 0).text()
+        self.hard_negative_capture_active = False
         self.refresh_case_editor()
         self.refresh_viewers()
 
@@ -573,10 +680,33 @@ class MainWindow(QMainWindow):
 
     def _apply_annotation_mode(self) -> None:
         enabled = self.annotation_toggle.isChecked()
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        pair = self.repo.get_pair(self.current_pair_id) if self.current_pair_id else None
+        if self.hard_negative_capture_active:
+            focus_bbox = self._focus_bbox_for_hard_negative(case, pair)
+            self.sat_view.set_crop_assist(True, focus_bbox=focus_bbox)
+            self.uav_view.set_annotation_tool("pan", enabled=False)
+            self.sat_view.set_annotation_tool("bbox", enabled=True)
+            if focus_bbox:
+                self.annotation_hint.setText(
+                    "Hard negative capture: yellow box marks the target area, drag a crop box that only partially contains it"
+                )
+            else:
+                self.annotation_hint.setText(
+                    "Hard negative capture: drag a crop box on the original satellite image"
+                )
+            self.sat_mode_label.setText("Satellite Mode: Hard Negative Capture")
+            return
+        self.sat_view.set_crop_assist(False)
         if not enabled:
             self.uav_view.set_annotation_tool("pan", enabled=False)
             self.sat_view.set_annotation_tool("pan", enabled=False)
             self.annotation_hint.setText("Normal browse mode")
+            if self.satellite_view_mode == "hard_negative":
+                self.sat_mode_label.setText("Satellite Mode: Hard Negative Preview")
+            else:
+                mode_name = "SAM3" if self.sat_annotation_mode == "sam3" else "Manual Polygon"
+                self.sat_mode_label.setText(f"Satellite Mode: {mode_name}")
             return
 
         if self.active_viewer_name == "uav":
@@ -584,6 +714,12 @@ class MainWindow(QMainWindow):
             self.sat_view.set_annotation_tool("pan", enabled=False)
             self.annotation_hint.setText("UAV annotation mode: drag a box, Ctrl+S save, Esc clear")
         else:
+            if self.satellite_view_mode == "hard_negative":
+                self.uav_view.set_annotation_tool("pan", enabled=False)
+                self.sat_view.set_annotation_tool("pan", enabled=False)
+                self.annotation_hint.setText("Hard negative preview is read-only. Switch back to original view to annotate.")
+                self.sat_mode_label.setText("Satellite Mode: Hard Negative Preview")
+                return
             sat_tool = "bbox" if self.sat_annotation_mode == "sam3" else "polygon"
             self.uav_view.set_annotation_tool("pan", enabled=False)
             self.sat_view.set_annotation_tool(sat_tool, enabled=True)
@@ -623,6 +759,11 @@ class MainWindow(QMainWindow):
 
             sam_action = menu.addAction("SAM3标注")
             manual_action = menu.addAction("手动标注")
+            delete_hard_negative_action = None
+            current_case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+            if self._case_has_hard_negative(current_case):
+                menu.addSeparator()
+                delete_hard_negative_action = menu.addAction("删除难负样本")
             selected_action = menu.exec(global_pos)
             if selected_action == sam_action:
                 self.sat_annotation_mode = "sam3"
@@ -630,6 +771,9 @@ class MainWindow(QMainWindow):
             elif selected_action == manual_action:
                 self.sat_annotation_mode = "manual"
                 self.log("Satellite annotation mode switched to manual polygon")
+            elif delete_hard_negative_action is not None and selected_action == delete_hard_negative_action:
+                self.delete_hard_negative()
+                return
             self.active_viewer_name = "sat"
             self._apply_annotation_mode()
         finally:
@@ -638,6 +782,100 @@ class MainWindow(QMainWindow):
     def next_case_color(self) -> str:
         cases = self.repo.list_annotation_cases(self.current_pair_id) if self.current_pair_id else []
         return CASE_COLORS[len(cases) % len(CASE_COLORS)]
+
+    def toggle_satellite_view(self) -> None:
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        if not self._case_has_hard_negative(case):
+            QMessageBox.information(self, "Hard Negative", "Current case does not have a hard negative image yet.")
+            return
+        self.hard_negative_capture_active = False
+        self.satellite_view_mode = "hard_negative" if self.satellite_view_mode == "original" else "original"
+        self.active_viewer_name = "sat"
+        self.refresh_viewers()
+        self._apply_annotation_mode()
+
+    def start_hard_negative_capture(self) -> None:
+        pair = self.repo.get_pair(self.current_pair_id) if self.current_pair_id else None
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        if not pair or not case:
+            QMessageBox.information(self, "Hard Negative", "Select a pair and case first.")
+            return
+        self.satellite_view_mode = "original"
+        self.hard_negative_capture_active = True
+        self.active_viewer_name = "sat"
+        self.sat_view.clear_draft()
+        self.refresh_satellite_view(pair=pair)
+        self.sat_view.fit_image()
+        self.sat_view.setFocus()
+        self._apply_annotation_mode()
+        self.log(f"Hard negative capture armed for case {case.case_name}")
+
+    def delete_hard_negative(self) -> None:
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        if not case:
+            QMessageBox.information(self, "Hard Negative", "Select a case first.")
+            return
+        pending = self._get_pending_hard_negative(case.case_id)
+        if not pending and not self._case_has_hard_negative(case):
+            QMessageBox.information(self, "Hard Negative", "Current case does not have a hard negative image.")
+            return
+        reply = QMessageBox.question(self, "Delete Hard Negative", "Delete the current case hard negative image?")
+        if reply != QMessageBox.Yes:
+            return
+
+        paths_to_remove = set()
+        if pending:
+            pending_path = pending.get("image_path", "")
+            if pending_path:
+                paths_to_remove.add(pending_path)
+        if case.hard_negative_image_path:
+            paths_to_remove.add(case.hard_negative_image_path)
+
+        self.pending_hard_negative_by_case.pop(case.case_id, None)
+        for path_str in paths_to_remove:
+            path = Path(path_str)
+            if path.exists():
+                path.unlink()
+
+        case.hard_negative_image_path = ""
+        case.hard_negative_bbox = []
+        self.hard_negative_capture_active = False
+        self.satellite_view_mode = "original"
+        self.repo.save_annotation_case(case)
+        self.load_pair(self.current_pair_id, keep_case_id=case.case_id)
+        self.log(f"Deleted hard negative for case {case.case_name}")
+
+    def _render_hard_negative_preview(self, bbox: list[float]) -> None:
+        pair = self.repo.get_pair(self.current_pair_id)
+        case = self.repo.get_annotation_case(self.current_case_id) if self.current_case_id else None
+        if not pair or not case:
+            return
+
+        output_dir = self.workspace_dir / "cases" / case.case_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "hard_negative.png"
+
+        with Image.open(pair.sat_image_path) as raw_image:
+            image = raw_image.convert("RGB")
+            image_width, image_height = image.size
+            x1 = max(0, min(int(round(bbox[0])), image_width - 1))
+            y1 = max(0, min(int(round(bbox[1])), image_height - 1))
+            x2 = max(x1 + 1, min(int(round(bbox[2])), image_width))
+            y2 = max(y1 + 1, min(int(round(bbox[3])), image_height))
+            cropped = image.crop((x1, y1, x2, y2))
+            resized = cropped.resize((image_width, image_height), Image.Resampling.LANCZOS)
+            resized.save(output_path)
+
+        self.pending_hard_negative_by_case[case.case_id] = {
+            "image_path": str(output_path),
+            "bbox": [float(x1), float(y1), float(x2), float(y2)],
+        }
+        self.hard_negative_capture_active = False
+        self.satellite_view_mode = "hard_negative"
+        self.refresh_case_editor()
+        self.refresh_viewers()
+        self._apply_annotation_mode()
+        self.log(f"Generated hard negative preview for case {case.case_name}: {output_path}")
 
     def create_case(self) -> None:
         if not self.current_pair_id:
@@ -677,6 +915,7 @@ class MainWindow(QMainWindow):
             return
         case_id = self.current_case_id
         self.current_case_id = ""
+        self.pending_hard_negative_by_case.pop(case_id, None)
         self.repo.delete_annotation_case(case_id)
         self.load_pair(self.current_pair_id)
 
@@ -685,12 +924,24 @@ class MainWindow(QMainWindow):
         if not case:
             return
         case.case_name = self.case_name_edit.text().strip() or case.case_name
-        case.case_type = self.case_type_combo.currentText()
+        case.case_type = normalize_case_type(self.case_type_combo.currentText())
         case.category = self.case_category_combo.currentText().strip()
         case.status = self.case_status_combo.currentText()
         case.description = self.case_description_edit.toPlainText().strip()
         case.notes = self.case_notes_edit.toPlainText().strip()
+        pending_hard_negative = self._get_pending_hard_negative(case.case_id)
+        if pending_hard_negative:
+            case.hard_negative_image_path = pending_hard_negative.get("image_path", "")
+            case.hard_negative_bbox = list(pending_hard_negative.get("bbox", []))
         self.repo.save_annotation_case(case)
+        if case.hard_negative_image_path:
+            self.log(
+                "Saved case metadata | "
+                f"case={case.case_name} | hard_negative={case.hard_negative_image_path} | "
+                "note=Save Case Metadata only stores metadata; use Save Anno to export into saved_anno/"
+            )
+        else:
+            self.log(f"Saved case metadata | case={case.case_name} | hard_negative=none")
         self.load_pair(self.current_pair_id, keep_case_id=case.case_id)
 
     def handle_ctrl_save(self) -> None:
@@ -706,8 +957,19 @@ class MainWindow(QMainWindow):
         if target_view.has_draft():
             target_view.clear_draft()
             self.log(f"Cleared draft on {self.active_viewer_name} viewer")
+            return
+        if self.hard_negative_capture_active and self.active_viewer_name == "sat":
+            self.hard_negative_capture_active = False
+            self._apply_annotation_mode()
+            self.log("Cancelled hard negative capture mode")
 
     def _on_draft_completed(self, viewer_name: str, draft_type: str) -> None:
+        if viewer_name == "sat" and draft_type == "bbox" and self.hard_negative_capture_active:
+            draft = self.sat_view.get_draft()
+            self.sat_view.clear_draft()
+            if draft.get("kind") == "bbox":
+                self._render_hard_negative_preview(draft["bbox"])
+            return
         if viewer_name == "sat" and draft_type == "bbox" and self.sat_annotation_mode == "sam3":
             self.run_sam3_preview()
 
@@ -862,6 +1124,12 @@ class MainWindow(QMainWindow):
         sat_dst = case_dir / Path(pair.sat_image_path).name
         shutil.copy2(pair.uav_image_path, uav_dst)
         shutil.copy2(pair.sat_image_path, sat_dst)
+        hard_negative_dst = ""
+        if case.hard_negative_image_path and Path(case.hard_negative_image_path).exists():
+            hard_negative_path = Path(case.hard_negative_image_path)
+            hard_negative_dst_path = case_dir / hard_negative_path.name
+            shutil.copy2(hard_negative_path, hard_negative_dst_path)
+            hard_negative_dst = str(hard_negative_dst_path)
 
         summary = {
             "pair_id": pair.pair_id,
@@ -877,6 +1145,8 @@ class MainWindow(QMainWindow):
             "color_hex": case.color_hex,
             "uav_image_path": str(uav_dst),
             "sat_image_path": str(sat_dst),
+            "hard_negative_image_path": hard_negative_dst,
+            "hard_negative_bbox": case.hard_negative_bbox,
             "uav_count": len(case.uav_annotations),
             "sat_count": len(case.sat_annotations),
         }

@@ -58,14 +58,18 @@ class AnnotatedImageView(QGraphicsView):
         self.saved_items: list = []
         self.reference_items: list = []
         self.draft_items: list = []
+        self.assist_items: list = []
 
         self.draw_start: QPointF | None = None
         self.draw_rect_item: QGraphicsRectItem | None = None
+        self.crop_overlay_item: QGraphicsPathItem | None = None
         self.draft_kind = ""
         self.draft_bbox: list[float] = []
         self.draft_points: list[QPointF] = []
         self.preview_pos: QPointF | None = None
         self.draft_mask_path = ""
+        self.crop_assist_enabled = False
+        self.crop_focus_bbox: list[float] = []
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         self.viewerActivated.emit(self.viewer_name)
@@ -81,8 +85,10 @@ class AnnotatedImageView(QGraphicsView):
         self.saved_items.clear()
         self.reference_items.clear()
         self.draft_items.clear()
+        self.assist_items.clear()
         self.image_item = None
         self.image_size = (0, 0)
+        self.crop_overlay_item = None
         self.clear_draft()
 
         if not image_path or not Path(image_path).exists():
@@ -108,10 +114,38 @@ class AnnotatedImageView(QGraphicsView):
         self.annotation_mode = enabled
         self.setDragMode(QGraphicsView.NoDrag if enabled and tool_name != "pan" else QGraphicsView.ScrollHandDrag)
 
+    def set_crop_assist(self, enabled: bool, focus_bbox: list[float] | None = None) -> None:
+        self.crop_assist_enabled = enabled
+        self.crop_focus_bbox = [float(v) for v in (focus_bbox or [])]
+        self._clear_assist_items()
+        self._clear_crop_overlay()
+        if not enabled or len(self.crop_focus_bbox) != 4 or not self.image_item:
+            return
+
+        x1, y1, x2, y2 = self.crop_focus_bbox
+        rect = QRectF(x1, y1, x2 - x1, y2 - y1).normalized()
+        focus_rect = QGraphicsRectItem(rect)
+        focus_rect.setPen(QPen(QColor(255, 215, 0), 3.0, Qt.DashLine))
+        focus_rect.setZValue(40)
+        self.scene().addItem(focus_rect)
+        self.assist_items.append(focus_rect)
+
+        cx = rect.center().x()
+        cy = rect.center().y()
+        cross_color = QColor(255, 215, 0, 180)
+        h_line = QGraphicsLineItem(rect.left(), cy, rect.right(), cy)
+        v_line = QGraphicsLineItem(cx, rect.top(), cx, rect.bottom())
+        for line in (h_line, v_line):
+            line.setPen(QPen(cross_color, 1.5, Qt.DotLine))
+            line.setZValue(40)
+            self.scene().addItem(line)
+            self.assist_items.append(line)
+
     def clear_draft(self) -> None:
         if self.draw_rect_item:
             self.scene().removeItem(self.draw_rect_item)
             self.draw_rect_item = None
+        self._clear_crop_overlay()
         for item in self.draft_items:
             self.scene().removeItem(item)
         self.draft_items.clear()
@@ -259,7 +293,8 @@ class AnnotatedImageView(QGraphicsView):
             if self.draw_rect_item:
                 self.scene().removeItem(self.draw_rect_item)
             self.draw_rect_item = QGraphicsRectItem()
-            self.draw_rect_item.setPen(QPen(QColor(80, 210, 255), 2.0, Qt.DashLine))
+            pen_color = QColor(255, 215, 0) if self.crop_assist_enabled else QColor(80, 210, 255)
+            self.draw_rect_item.setPen(QPen(pen_color, 2.0, Qt.DashLine))
             self.draw_rect_item.setZValue(50)
             self.scene().addItem(self.draw_rect_item)
             return
@@ -276,7 +311,10 @@ class AnnotatedImageView(QGraphicsView):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         scene_pos = self._clamp(self.mapToScene(event.position().toPoint()))
         if self.draw_start is not None and self.draw_rect_item is not None:
-            self.draw_rect_item.setRect(QRectF(self.draw_start, scene_pos).normalized())
+            rect = QRectF(self.draw_start, scene_pos).normalized()
+            self.draw_rect_item.setRect(rect)
+            if self.crop_assist_enabled:
+                self._update_crop_overlay(rect)
             return
         if self.annotation_mode and self.active_tool == "polygon" and self.draft_points:
             self.preview_pos = scene_pos
@@ -298,12 +336,14 @@ class AnnotatedImageView(QGraphicsView):
             self.scene().removeItem(self.draw_rect_item)
             self.draw_rect_item = None
             self.draw_start = None
+            self._clear_crop_overlay()
             if rect.width() > 3 and rect.height() > 3:
                 self.clear_draft()
                 self.draft_kind = "bbox"
                 self.draft_bbox = [rect.left(), rect.top(), rect.right(), rect.bottom()]
                 draft_rect = QGraphicsRectItem(rect)
-                draft_rect.setPen(QPen(QColor(80, 210, 255), 2.0, Qt.DashLine))
+                pen_color = QColor(255, 215, 0) if self.crop_assist_enabled else QColor(80, 210, 255)
+                draft_rect.setPen(QPen(pen_color, 2.0, Qt.DashLine))
                 draft_rect.setZValue(51)
                 self.scene().addItem(draft_rect)
                 self.draft_items.append(draft_rect)
@@ -378,6 +418,33 @@ class AnnotatedImageView(QGraphicsView):
             self.draft_items.append(item)
         else:
             self.saved_items.append(item)
+
+    def _update_crop_overlay(self, rect: QRectF) -> None:
+        if not self.crop_assist_enabled or not self.image_item:
+            return
+        self._clear_crop_overlay()
+        image_rect = QRectF(0, 0, self.image_size[0], self.image_size[1])
+        path = QPainterPath()
+        path.addRect(image_rect)
+        hole = QPainterPath()
+        hole.addRect(rect.normalized())
+        path = path.subtracted(hole)
+        overlay_item = QGraphicsPathItem(path)
+        overlay_item.setPen(QPen(Qt.NoPen))
+        overlay_item.setBrush(QColor(0, 0, 0, 110))
+        overlay_item.setZValue(49)
+        self.scene().addItem(overlay_item)
+        self.crop_overlay_item = overlay_item
+
+    def _clear_crop_overlay(self) -> None:
+        if self.crop_overlay_item is not None:
+            self.scene().removeItem(self.crop_overlay_item)
+            self.crop_overlay_item = None
+
+    def _clear_assist_items(self) -> None:
+        for item in self.assist_items:
+            self.scene().removeItem(item)
+        self.assist_items.clear()
 
     def render_to_image(self) -> QImage:
         rect = self.sceneRect().toRect()
