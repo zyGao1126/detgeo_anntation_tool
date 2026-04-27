@@ -78,6 +78,16 @@ python -u -m detgeo_annotation_tool.services.sam3_worker \
 - `/home/gaoziyang/research/RRSIS/sam3`
 - `/home/gaoziyang/research/RRSIS/sam3/checkpoints/sam3.pt`
 
+如果你的目录结构是：
+
+```text
+~/projects/
+├── detgeo_annotation_tool/
+└── sam3/
+```
+
+当前版本也会优先自动发现同级的 `../sam3`，不必强制依赖环境变量。
+
 ## 安装
 
 推荐使用同一个 `conda` 环境同时安装本工具和 `SAM3`。下面是一套别人 clone 后可以直接照着执行的流程。
@@ -139,6 +149,18 @@ conda install -c conda-forge xcb-util-cursor
 ```bash
 cd ~/projects/sam3
 pip install -e .
+```
+
+但截至目前，`SAM3` 这份仓库在实际推理时还额外依赖几个没有被完整声明的包，而且新版 `setuptools` 已移除了 `pkg_resources`，会导致加载时报：
+
+```text
+No module named 'pkg_resources'
+```
+
+因此建议紧接着补这一行：
+
+```bash
+pip install "setuptools<81" einops pycocotools psutil
 ```
 
 ### 5. 下载 SAM3 权重

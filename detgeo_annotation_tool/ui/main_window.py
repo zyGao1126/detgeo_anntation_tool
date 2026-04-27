@@ -170,8 +170,16 @@ class MainWindow(QMainWindow):
         return self.current_pair_id or "uav_view"
 
     def _resolve_sam3_paths(self) -> tuple[Path, Path]:
-        default_repo_root = Path("/home/gaoziyang/research/RRSIS/sam3")
-        repo_root = Path(os.environ.get("DETGEO_SAM3_REPO", str(default_repo_root))).expanduser()
+        project_root = Path(__file__).resolve().parents[2]
+        bundled_repo_root = project_root.parent / "sam3"
+        fallback_repo_root = Path("/home/gaoziyang/research/RRSIS/sam3")
+        repo_root_env = os.environ.get("DETGEO_SAM3_REPO")
+        if repo_root_env:
+            repo_root = Path(repo_root_env).expanduser()
+        elif bundled_repo_root.exists():
+            repo_root = bundled_repo_root
+        else:
+            repo_root = fallback_repo_root
         default_checkpoint = repo_root / "checkpoints" / "sam3.pt"
         checkpoint_path = Path(
             os.environ.get("DETGEO_SAM3_CHECKPOINT", str(default_checkpoint))

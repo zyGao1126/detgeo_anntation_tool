@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ class SAM3Backend:
         self._processor = None
         self._device = None
         self._load_error = ""
+        self._torch = None
+        self._autocast_dtype = None
 
     def is_available(self) -> tuple[bool, str]:
         if not self.repo_root.exists():
@@ -42,7 +45,14 @@ class SAM3Backend:
             from sam3.model.sam3_image_processor import Sam3Processor
             from sam3.model_builder import build_sam3_image_model
 
+            self._torch = torch
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self._device == "cuda":
+                self._autocast_dtype = (
+                    torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                )
+            else:
+                self._autocast_dtype = None
             model = build_sam3_image_model(
                 checkpoint_path=str(self.checkpoint_path),
                 load_from_HF=False,
@@ -54,6 +64,11 @@ class SAM3Backend:
         except Exception as exc:
             self._load_error = str(exc)
             raise
+
+    def _inference_context(self):
+        if self._torch is None or self._device != "cuda" or self._autocast_dtype is None:
+            return nullcontext()
+        return self._torch.autocast(device_type="cuda", dtype=self._autocast_dtype)
 
     def preload(self) -> tuple[bool, str]:
         available, reason = self.is_available()
@@ -87,14 +102,15 @@ class SAM3Backend:
         cy = ((y1 + y2) / 2.0) / img_h
         bw = abs(x2 - x1) / img_w
         bh = abs(y2 - y1) / img_h
-        state = self._processor.set_image(image)
-        output = self._processor.add_geometric_prompt(
-            box=[cx, cy, bw, bh],
-            label=True,
-            state=state,
-        )
+        with self._inference_context():
+            state = self._processor.set_image(image)
+            output = self._processor.add_geometric_prompt(
+                box=[cx, cy, bw, bh],
+                label=True,
+                state=state,
+            )
 
-        scores = output["scores"].detach().cpu().numpy()
+        scores = output["scores"].detach().float().cpu().numpy()
         if scores.size == 0:
             raise RuntimeError("SAM3 returned no mask candidates for this box.")
         best_index = int(np.argmax(scores))
@@ -107,7 +123,7 @@ class SAM3Backend:
             .astype(np.uint8)
             * 255
         )
-        box = output["boxes"][best_index].detach().cpu().numpy().tolist()
+        box = output["boxes"][best_index].detach().float().cpu().numpy().tolist()
         return SAM3Result(
             bbox_xyxy=[float(v) for v in box],
             mask=Image.fromarray(mask_np, mode="L"),
