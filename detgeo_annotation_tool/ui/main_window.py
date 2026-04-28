@@ -106,11 +106,13 @@ class MainWindow(QMainWindow):
         self.saved_anno_root.mkdir(parents=True, exist_ok=True)
         self.ui_state_path = self.workspace_dir / "ui_state.json"
         self.ui_state = self._load_ui_state()
+        self.sam3_device_preference = self._resolve_sam3_device_preference()
         sam3_repo_root, sam3_checkpoint_path = self._resolve_sam3_paths()
         self.sam3_client = SAM3ProcessClient(
             project_root=self.project_root,
             repo_root=sam3_repo_root,
             checkpoint_path=sam3_checkpoint_path,
+            device=self.sam3_device_preference,
             parent=self,
         )
         self.sam3_preload_scheduled = False
@@ -137,6 +139,7 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self.log(f"SAM3 repo root: {sam3_repo_root}")
         self.log(f"SAM3 checkpoint: {sam3_checkpoint_path}")
+        self.log(f"SAM3 device preference: {self.sam3_device_preference or 'not selected'}")
 
     def _load_ui_state(self) -> dict:
         if not self.ui_state_path.exists():
@@ -151,6 +154,55 @@ class MainWindow(QMainWindow):
             json.dumps(self.ui_state, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def _normalize_sam3_device_value(self, value: str | None, allow_empty: bool = False) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            if allow_empty:
+                return ""
+            return "auto"
+        if text in {"auto", "cpu", "cuda"}:
+            return text
+        if re.fullmatch(r"cuda:\d+", text):
+            return text
+        raise ValueError("SAM3 device must be auto, cpu, cuda, or cuda:N")
+
+    def _resolve_sam3_device_preference(self) -> str:
+        env_value = os.environ.get("DETGEO_SAM3_DEVICE")
+        if env_value is not None:
+            raw_value = env_value
+            allow_empty = False
+        else:
+            raw_value = self.ui_state.get("sam3_device", "")
+            allow_empty = True
+        try:
+            return self._normalize_sam3_device_value(raw_value, allow_empty=allow_empty)
+        except ValueError:
+            return ""
+
+    def _list_sam3_device_options(self) -> list[str]:
+        options = [""]
+        if os.environ.get("DETGEO_SAM3_DEVICE") is None:
+            options.append("auto")
+        options.append("cpu")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                options.extend(f"cuda:{index}" for index in range(torch.cuda.device_count()))
+        except Exception:
+            pass
+        if self.sam3_device_preference not in options:
+            options.append(self.sam3_device_preference)
+        return options
+
+    def _set_sam3_device_combo_value(self, value: str) -> None:
+        normalized = self._normalize_sam3_device_value(value, allow_empty=True)
+        self.sam3_device_combo.blockSignals(True)
+        index = self.sam3_device_combo.findText(normalized)
+        if index >= 0:
+            self.sam3_device_combo.setCurrentIndex(index)
+        self.sam3_device_combo.blockSignals(False)
 
     def _default_category_for_class(self, original_class: str) -> str:
         return DETGEO_CATEGORY_MAPPING.get(original_class, CATEGORY_OPTIONS[0])
@@ -231,6 +283,9 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _schedule_sam3_preload(self) -> None:
+        if not self.sam3_device_preference:
+            self.log("SAM3 preload skipped until a device is selected")
+            return
         if self.sam3_preload_scheduled or self.sam3_state in {"starting", "ready", "busy"}:
             return
         self.sam3_preload_scheduled = True
@@ -363,9 +418,16 @@ class MainWindow(QMainWindow):
         self.reference_toggle.setChecked(True)
         self.annotation_hint = QLabel("Normal browse mode")
         self.sat_mode_label = QLabel("Satellite Mode: SAM3")
+        self.sam3_device_combo = QComboBox()
+        self.sam3_device_combo.addItems(self._list_sam3_device_options())
+        self._set_sam3_device_combo_value(self.sam3_device_preference)
+        self.sam3_device_combo.setItemText(0, "Select device...")
+        self.sam3_device_combo.setToolTip("Choose which device SAM3 should load on")
         controls.addWidget(self.annotation_toggle)
         controls.addWidget(self.reference_toggle)
         controls.addWidget(self.annotation_hint, 1)
+        controls.addWidget(QLabel("SAM3 Device"))
+        controls.addWidget(self.sam3_device_combo)
         controls.addWidget(self.sat_mode_label)
         layout.addLayout(controls)
 
@@ -491,6 +553,7 @@ class MainWindow(QMainWindow):
         self.toggle_satellite_view_button.clicked.connect(self.toggle_satellite_view)
         self.cases_table.itemSelectionChanged.connect(self._on_case_table_selected)
         self.export_button.clicked.connect(self.export_workspace)
+        self.sam3_device_combo.currentTextChanged.connect(self._on_sam3_device_selected)
         self.sam3_client.stateChanged.connect(self._on_sam3_state_changed)
         self.sam3_client.segmentFinished.connect(self._on_sam3_segment_finished)
         self.sam3_client.logMessage.connect(self.log)
@@ -685,6 +748,42 @@ class MainWindow(QMainWindow):
     def _on_viewer_activated(self, viewer_name: str) -> None:
         self.active_viewer_name = viewer_name
         self._apply_annotation_mode()
+
+    def _on_sam3_device_selected(self, value: str) -> None:
+        try:
+            normalized = self._normalize_sam3_device_value(value, allow_empty=True)
+        except ValueError:
+            QMessageBox.warning(self, "SAM3 Device", "设备格式无效，请使用 auto、cpu 或 cuda:N。")
+            self._set_sam3_device_combo_value(self.sam3_device_preference)
+            return
+
+        if normalized == self.sam3_device_preference:
+            return
+
+        if self.sam3_state == "busy":
+            QMessageBox.information(self, "SAM3 Device", "SAM3 正在执行分割，请稍后再切换设备。")
+            self._set_sam3_device_combo_value(self.sam3_device_preference)
+            return
+
+        self.sam3_device_preference = normalized
+        self.ui_state["sam3_device"] = normalized
+        self._save_ui_state()
+        if normalized:
+            self.sam3_client.set_device(normalized)
+        self.sam3_preload_scheduled = False
+        self.sam3_pending_preview = None
+        if normalized:
+            self.log(f"SAM3 device preference updated to {normalized}, restarting worker")
+        else:
+            self.log("SAM3 device selection cleared")
+        self.sam3_client.shutdown()
+        if normalized:
+            self._start_sam3_preload()
+        else:
+            self.sam3_state = "idle"
+            self.sam3_message = "Select a SAM3 device to start the model."
+            self.sam3_device = ""
+            self._apply_annotation_mode()
 
     def _apply_annotation_mode(self) -> None:
         enabled = self.annotation_toggle.isChecked()

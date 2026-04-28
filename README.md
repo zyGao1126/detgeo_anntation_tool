@@ -72,6 +72,9 @@ python -u -m detgeo_annotation_tool.services.sam3_worker \
 
 - `DETGEO_SAM3_REPO`: `SAM3` 仓库根目录
 - `DETGEO_SAM3_CHECKPOINT`: `SAM3` checkpoint 文件路径
+- `DETGEO_SAM3_DEVICE`: `SAM3` 推理设备，支持 `auto`、`cpu`、`cuda:N`
+
+如果不设置 `DETGEO_SAM3_DEVICE`，GUI 启动后不会自动加载 `SAM3`，需要先在顶部 `SAM3 Device` 下拉框里手动选择设备，再启动模型。这样可以避免默认占用 `cuda:0`。
 
 如果不设置环境变量，代码会回退到作者本机默认路径：
 
@@ -193,9 +196,10 @@ mkdir -p ~/projects/sam3/checkpoints
 ```bash
 export DETGEO_SAM3_REPO=~/projects/sam3
 export DETGEO_SAM3_CHECKPOINT=~/projects/sam3/checkpoints/sam3.pt
+export DETGEO_SAM3_DEVICE=cuda:1
 ```
 
-建议把这两行写进 `~/.bashrc`、`~/.zshrc` 或项目启动脚本里。
+建议把这几行写进 `~/.bashrc`、`~/.zshrc` 或项目启动脚本里。GUI 内也可以直接通过顶部的 `SAM3 Device` 下拉框切换设备，切换后会自动重启 `SAM3 worker`。
 
 ### 7. 验证环境
 

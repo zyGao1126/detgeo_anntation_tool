@@ -17,14 +17,56 @@ class SAM3Result:
 
 
 class SAM3Backend:
-    def __init__(self, repo_root: Path, checkpoint_path: Path):
+    def __init__(self, repo_root: Path, checkpoint_path: Path, device: str = "auto"):
         self.repo_root = Path(repo_root)
         self.checkpoint_path = Path(checkpoint_path)
+        self.requested_device = self._normalize_device_spec(device)
         self._processor = None
         self._device = None
         self._load_error = ""
         self._torch = None
         self._autocast_dtype = None
+
+    @staticmethod
+    def _normalize_device_spec(device: str | None) -> str:
+        value = str(device or "").strip().lower()
+        if not value:
+            return "auto"
+        if value in {"auto", "cpu", "cuda"}:
+            return value
+        if value.startswith("cuda:") and value[5:].isdigit():
+            return value
+        raise ValueError(
+            f"Unsupported SAM3 device '{device}'. Use auto, cpu, cuda, or cuda:N."
+        )
+
+    def _resolve_device(self, torch) -> str:
+        if self.requested_device == "auto":
+            if not torch.cuda.is_available():
+                return "cpu"
+            device_index = torch.cuda.current_device()
+            torch.cuda.set_device(device_index)
+            return f"cuda:{device_index}"
+
+        if self.requested_device == "cpu":
+            return "cpu"
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested CUDA for SAM3, but no CUDA device is available.")
+
+        if self.requested_device == "cuda":
+            device_index = torch.cuda.current_device()
+            torch.cuda.set_device(device_index)
+            return f"cuda:{device_index}"
+
+        device_index = int(self.requested_device.split(":", 1)[1])
+        device_count = torch.cuda.device_count()
+        if device_index < 0 or device_index >= device_count:
+            raise RuntimeError(
+                f"Requested SAM3 device cuda:{device_index}, but only {device_count} CUDA device(s) are visible."
+            )
+        torch.cuda.set_device(device_index)
+        return f"cuda:{device_index}"
 
     def is_available(self) -> tuple[bool, str]:
         if not self.repo_root.exists():
@@ -46,8 +88,8 @@ class SAM3Backend:
             from sam3.model_builder import build_sam3_image_model
 
             self._torch = torch
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
-            if self._device == "cuda":
+            self._device = self._resolve_device(torch)
+            if self._device.startswith("cuda"):
                 self._autocast_dtype = (
                     torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                 )
@@ -66,7 +108,12 @@ class SAM3Backend:
             raise
 
     def _inference_context(self):
-        if self._torch is None or self._device != "cuda" or self._autocast_dtype is None:
+        if (
+            self._torch is None
+            or not self._device
+            or not self._device.startswith("cuda")
+            or self._autocast_dtype is None
+        ):
             return nullcontext()
         return self._torch.autocast(device_type="cuda", dtype=self._autocast_dtype)
 

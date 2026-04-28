@@ -12,11 +12,19 @@ class SAM3ProcessClient(QObject):
     segmentFinished = Signal(bool, dict)
     logMessage = Signal(str)
 
-    def __init__(self, project_root: Path, repo_root: Path, checkpoint_path: Path, parent=None):
+    def __init__(
+        self,
+        project_root: Path,
+        repo_root: Path,
+        checkpoint_path: Path,
+        device: str = "auto",
+        parent=None,
+    ):
         super().__init__(parent)
         self.project_root = Path(project_root)
         self.repo_root = Path(repo_root)
         self.checkpoint_path = Path(checkpoint_path)
+        self.device_preference = str(device or "auto").strip() or "auto"
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(self.project_root))
         self.process.readyReadStandardOutput.connect(self._on_stdout_ready)
@@ -46,11 +54,15 @@ class SAM3ProcessClient(QObject):
     def is_ready(self) -> bool:
         return self._state == "ready"
 
+    def set_device(self, device: str) -> None:
+        self.device_preference = str(device or "auto").strip() or "auto"
+
     def start(self) -> None:
         if self._state in {"starting", "ready", "busy"}:
             return
         self._stdout_buffer = ""
         self._stderr_buffer = ""
+        self._device = ""
         self._request_in_flight = ""
         self._set_state("starting", "Starting SAM3 worker...")
         self.process.start(
@@ -63,6 +75,8 @@ class SAM3ProcessClient(QObject):
                 str(self.repo_root),
                 "--checkpoint",
                 str(self.checkpoint_path),
+                "--device",
+                self.device_preference,
             ],
         )
 
@@ -90,6 +104,7 @@ class SAM3ProcessClient(QObject):
     def shutdown(self) -> None:
         if self.process.state() == QProcess.NotRunning:
             return
+        self._device = ""
         self.process.write(b'{"cmd":"shutdown"}\n')
         self.process.waitForFinished(1000)
         if self.process.state() != QProcess.NotRunning:
@@ -98,6 +113,8 @@ class SAM3ProcessClient(QObject):
         if self.process.state() != QProcess.NotRunning:
             self.process.kill()
             self.process.waitForFinished(1000)
+        if self.process.state() == QProcess.NotRunning and self._state not in {"stopped", "idle"}:
+            self._set_state("stopped", "SAM3 worker stopped.")
 
     def _set_state(self, state: str, message: str) -> None:
         self._state = state

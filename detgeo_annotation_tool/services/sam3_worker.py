@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,12 +18,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DetGeo SAM3 worker")
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--device", default=os.environ.get("DETGEO_SAM3_DEVICE", "auto"))
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    backend = SAM3Backend(repo_root=args.repo_root, checkpoint_path=args.checkpoint)
+    backend = SAM3Backend(
+        repo_root=args.repo_root,
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+    )
     ok, message = backend.preload()
     if not ok:
         _emit({"event": "ready", "ok": False, "message": message})
